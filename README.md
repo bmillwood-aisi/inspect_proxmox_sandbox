@@ -52,8 +52,17 @@ them are isolated out of the box.
 If you provision Proxmox some other way, configure equivalent persistent rules
 **on the node**. The Proxmox rules accept management ports only on the
 default-route interface (where external callers arrive) and leave SDN DNS/DHCP
-open. The raw-table rules block forwarded sandbox traffic to the fixed EC2
-metadata endpoints without preventing host processes from using them:
+open. The remaining rules enforce RFC 3927 section 7, which Linux's forward path
+ignores: a router must not forward IPv4 link-local (`169.254.0.0/16`) traffic, but
+Linux forwards it anyway, so dropping it stops a sandbox guest reaching the host's
+cloud metadata service — and any other link-local endpoint — over its on-link route. The
+destination drop goes in `raw PREROUTING` (host requests are `OUTPUT`, never
+`PREROUTING`, so the host keeps its own access); the source drop goes in
+`FORWARD`, **not** `PREROUTING`, so the host's own replies (e.g. an IMDS or
+`169.254.169.253` DNS response, delivered to `INPUT`) are left intact — a
+`raw PREROUTING -s` rule would drop them and break the host. IPv6 is not
+supported for sandbox guests, so it is disabled on guest interfaces and
+forwarded v6 is dropped:
 
 ```bash
 NIC=$(ip route show default | awk '{print $5}' | head -1)
@@ -64,18 +73,27 @@ pvesh create /nodes/$(hostname)/firewall/rules --type in --action ACCEPT --proto
 pvesh create /nodes/$(hostname)/firewall/rules --type in --action ACCEPT --proto udp --dport 67 --enable 1
 pvesh set /nodes/$(hostname)/firewall/options --enable 1
 pvesh set /cluster/firewall/options --enable 1
-iptables -w -t raw -C PREROUTING -d 169.254.169.254/32 -j DROP 2>/dev/null \
-    || iptables -w -t raw -I PREROUTING 1 -d 169.254.169.254/32 -j DROP
+iptables -w -t raw -C PREROUTING -d 169.254.0.0/16 -j DROP 2>/dev/null \
+    || iptables -w -t raw -I PREROUTING 1 -d 169.254.0.0/16 -j DROP
+iptables -w -C FORWARD -s 169.254.0.0/16 -j DROP 2>/dev/null \
+    || iptables -w -I FORWARD 1 -s 169.254.0.0/16 -j DROP
+sysctl -w net.ipv6.conf.default.disable_ipv6=1   # new SDN bridges come up v6-off
 if command -v ip6tables >/dev/null; then
-    ip6tables -w -t raw -C PREROUTING -d fd00:ec2::254/128 -j DROP 2>/dev/null \
-        || ip6tables -w -t raw -I PREROUTING 1 -d fd00:ec2::254/128 -j DROP
+    ip6tables -w -C FORWARD -j DROP 2>/dev/null || ip6tables -w -A FORWARD -j DROP
 fi
 ```
 
-Persist the raw-table rules across reboots using your host firewall tooling or
-a systemd unit. The bundled provisioning scripts install such a unit.
-Upgrading this package does not modify existing Proxmox hosts or templates;
-rebuild them or apply these rules manually.
+Most clouds (AWS, GCP, Azure, Oracle, DigitalOcean) serve metadata from
+`169.254.169.254`, covered above. Two providers sit outside the link-local
+range: **Alibaba Cloud** uses `100.100.100.200`, and **Azure** exposes the
+WireServer at `168.63.129.16` (guest-agent goal state / extension settings). On
+those clouds, add a `-d <ip>/32 -j DROP` raw-table rule for each — the host
+keeps access since its own traffic doesn't traverse `PREROUTING`.
+
+Persist these rules across reboots using your host firewall tooling or a systemd
+unit (and `sysctl.d` for the IPv6 default). The bundled provisioning scripts do
+this. Upgrading this package does not modify existing Proxmox hosts or
+templates; rebuild them or apply these rules manually.
 
 ### Single Proxmox Instance
 

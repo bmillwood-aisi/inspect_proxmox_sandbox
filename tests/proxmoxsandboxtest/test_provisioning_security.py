@@ -30,14 +30,24 @@ def test_ec2_launch_requires_imdsv2_with_one_hop() -> None:
         VIRTUALIZED_SCRIPT,
     ],
 )
-def test_provisioners_block_forwarded_cloud_metadata(
-    provisioner: Path,
-) -> None:
+def test_provisioners_enforce_rfc3927_and_disable_ipv6(provisioner: Path) -> None:
+    # Both provisioners enforce RFC 3927 section 7 (a router must not forward IPv4
+    # link-local), rather than denylisting one cloud's metadata IP, and treat
+    # IPv6 as unsupported for sandbox guests. The two blocks are kept identical.
     script = provisioner.read_text()
 
-    assert "iptables -w -t raw -C PREROUTING -d 169.254.169.254/32 -j DROP" in script
-    assert "iptables -w -t raw -I PREROUTING 1 -d 169.254.169.254/32 -j DROP" in script
-    assert "ip6tables -w -t raw -C PREROUTING -d fd00:ec2::254/128 -j DROP" in script
-    assert "ip6tables -w -t raw -I PREROUTING 1 -d fd00:ec2::254/128 -j DROP" in script
+    # Destination drop in raw PREROUTING (host requests are OUTPUT, unaffected).
+    assert "iptables -w -t raw -I PREROUTING 1 -d 169.254.0.0/16 -j DROP" in script
+    # Source drop in FORWARD, not PREROUTING, so the host's own link-local
+    # replies (INPUT) are left intact.
+    assert "iptables -w -I FORWARD 1 -s 169.254.0.0/16 -j DROP" in script
+    assert "iptables -w -t raw -I PREROUTING 1 -s 169.254.0.0/16 -j DROP" not in script
+    # IPv6 unsupported: disabled on guest interfaces + forwarded v6 dropped.
+    assert "net.ipv6.conf.default.disable_ipv6 = 1" in script
+    assert "ip6tables -w -A FORWARD -j DROP" in script
+    # Boot service installed and enabled.
     assert "ExecStart=/usr/local/bin/inspect-proxmox-block-cloud-metadata.sh" in script
     assert "systemctl enable inspect-proxmox-block-cloud-metadata.service" in script
+    # The single-cloud denylist is gone.
+    assert "169.254.169.254/32" not in script
+    assert "fd00:ec2::254" not in script
